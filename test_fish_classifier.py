@@ -29,27 +29,17 @@ def load_onnx_model():
 def save_transformed_img(transformed, image_path):
     # Convert tensor to numpy, unnormalize, and save as white background
     img_np = (transformed * 0.5 + 0.5).clamp(0, 1).mul(255).byte().cpu().numpy()
-    img_np = img_np.transpose(1, 2, 0)  # C,H,W -> H,W,C
-    # Ensure 3 channels for PIL
-    if img_np.shape[2] == 1:
-        img_np = np.repeat(img_np, 3, axis=2)
-    img_pil = Image.fromarray(img_np)
-    # Convert to RGB and paste on white background
-    if img_pil.mode != 'RGB':
-        img_pil = img_pil.convert('RGB')
-    bg = Image.new('RGB', img_pil.size, (255, 255, 255))
-    bg.paste(img_pil, mask=None)
-    bg.save("transformed_img_" + os.path.basename(image_path))
+    if img_np.shape[0] == 1:
+        img_np = img_np.squeeze(0)  # (1, H, W) -> (H, W)
+    img_pil = Image.fromarray(img_np.astype(np.uint8), mode="L")
+    img_pil.save("transformed_img_" + os.path.basename(image_path))
 
 def predict(model, image_path, save_transformed=False):
     image = pil_loader_white_bg(image_path)
     transformed = basic_transform(image)
     if save_transformed:
-        img_np = (transformed * 0.5 + 0.5).clamp(0, 1).mul(255).byte().cpu().numpy()
-        img_np = img_np.transpose(1, 2, 0)
-        img_pil = Image.fromarray(img_np)
-        img_pil.save("transformed_img_" + os.path.basename(image_path))
-    # ONNX expects numpy array, shape (1,3,224,224), float32
+        save_transformed_img(transformed, image_path)
+    # ONNX expects numpy array, shape (1,1,224,224), float32
     input_tensor = transformed.unsqueeze(0).cpu().numpy().astype(np.float32)
     session = load_onnx_model()
     outputs = session.run(None, {session.get_inputs()[0].name: input_tensor})

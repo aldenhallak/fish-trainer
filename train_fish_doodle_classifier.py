@@ -14,53 +14,63 @@ from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from torchvision.models import ResNet18_Weights
+
 
 # === CONFIG ===
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-BATCH_SIZE = 32
+BATCH_SIZE = 50  # Smaller batch size for small dataset
 EPOCHS = 100
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-4  # Higher learning rate for faster convergence
 VAL_SPLIT = 0.2
+PATIENCE = 5  # Early stopping patience
 
 # === UTILS: PIL loader with white background ===
 def pil_loader_white_bg(path):
-    img = Image.open(path)
-    if img.mode in ("RGBA", "LA") or (img.mode == "P" and 'transparency' in img.info):
-        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-        img = Image.alpha_composite(bg, img.convert("RGBA")).convert("RGB")
-    else:
-        img = img.convert("RGB")
+    img = Image.open(path).convert("L")  # Convert to grayscale
+    # Binarize: everything not white becomes black
+    arr = np.array(img)
+    # Threshold: set all pixels < 250 to 0 (black), else 255 (white)
+    arr = np.where(arr < 250, 0, 255).astype(np.uint8)
+    img = Image.fromarray(arr, mode="L")
     return img
-
-# === TRANSFORMS ===
-basic_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.Lambda(lambda img: pil_loader_white_bg(img) if isinstance(img, str) else img),
-    transforms.Grayscale(num_output_channels=3),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
-])
-
-augmented_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.Lambda(lambda img: pil_loader_white_bg(img) if isinstance(img, str) else img),
-    transforms.Grayscale(num_output_channels=3),
-    transforms.RandomRotation(15),
-    transforms.RandomAffine(0, translate=(0.1, 0.1)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
-])
 
 # === MODEL ===
 def get_model():
-    model = models.resnet18(pretrained=True)
+    model = models.resnet18(weights=ResNet18_Weights.DEFAULT)
+    # Change first conv layer to accept 1 channel
+    model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    # If using pretrained weights, average across RGB for conv1
+    with torch.no_grad():
+        orig_weight = models.resnet18(weights=ResNet18_Weights.DEFAULT).conv1.weight
+        model.conv1.weight[:] = orig_weight.mean(dim=1, keepdim=True)
     model.fc = nn.Sequential(
         nn.Linear(model.fc.in_features, 1)
     )
     return model.to(DEVICE)
 
+# === TRANSFORMS ===
+basic_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.Lambda(lambda img: pil_loader_white_bg(img) if isinstance(img, str) else img),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5])
+])
+
+augmented_transform = transforms.Compose([
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.Resize((224, 224)),
+    transforms.Lambda(lambda img: pil_loader_white_bg(img) if isinstance(img, str) else img),
+    transforms.Grayscale(num_output_channels=1),
+    transforms.RandomRotation(15),
+    transforms.RandomAffine(0, translate=(0.1, 0.1)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5])
+])
+
 # === TRAINING FUNCTION ===
-def train(model, train_loader, val_loader, class_weights, epochs=5, patience=5):
+def train(model, train_loader, val_loader, class_weights, epochs=5, patience=PATIENCE):
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([class_weights[0]/class_weights[1]]).to(DEVICE))
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     best_val_loss = float('inf')
@@ -227,7 +237,7 @@ def main():
 
     print("Exporting model to fish_doodle_classifier.onnx...")
     model.eval()  # Ensure eval mode before export
-    dummy_input = torch.randn(1, 3, 224, 224, device=DEVICE)
+    dummy_input = torch.randn(1, 1, 224, 224, device=DEVICE)
     torch.onnx.export(
         model,
         dummy_input,
