@@ -1,11 +1,14 @@
 import os
 import torch
-from train_fish_doodle_classifier import get_model, DEVICE, basic_transform
+from train_fish_doodle_classifier import get_model, DEVICE, basic_transform, pil_loader_white_bg
 from PIL import Image
 from tqdm import tqdm
 from sklearn.metrics import classification_report
+import onnxruntime as ort
+import numpy as np
 
 MODEL_PATH = "fish_doodle_classifier.pth"
+ONNX_MODEL_PATH = "fish_doodle_classifier.onnx"
 DATASET_DIR = "dataset"
 
 # Load model
@@ -15,12 +18,42 @@ def load_model():
     model.eval()
     return model
 
-def predict(model, image_path):
-    image = Image.open(image_path)
-    image = basic_transform(image).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        output = model(image)
-        prob = torch.sigmoid(output).item()
+# Load ONNX model
+onnx_session = None
+def load_onnx_model():
+    global onnx_session
+    if onnx_session is None:
+        onnx_session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
+    return onnx_session
+
+def save_transformed_img(transformed, image_path):
+    # Convert tensor to numpy, unnormalize, and save as white background
+    img_np = (transformed * 0.5 + 0.5).clamp(0, 1).mul(255).byte().cpu().numpy()
+    img_np = img_np.transpose(1, 2, 0)  # C,H,W -> H,W,C
+    # Ensure 3 channels for PIL
+    if img_np.shape[2] == 1:
+        img_np = np.repeat(img_np, 3, axis=2)
+    img_pil = Image.fromarray(img_np)
+    # Convert to RGB and paste on white background
+    if img_pil.mode != 'RGB':
+        img_pil = img_pil.convert('RGB')
+    bg = Image.new('RGB', img_pil.size, (255, 255, 255))
+    bg.paste(img_pil, mask=None)
+    bg.save("transformed_img_" + os.path.basename(image_path))
+
+def predict(model, image_path, save_transformed=False):
+    image = pil_loader_white_bg(image_path)
+    transformed = basic_transform(image)
+    if save_transformed:
+        img_np = (transformed * 0.5 + 0.5).clamp(0, 1).mul(255).byte().cpu().numpy()
+        img_np = img_np.transpose(1, 2, 0)
+        img_pil = Image.fromarray(img_np)
+        img_pil.save("transformed_img_" + os.path.basename(image_path))
+    # ONNX expects numpy array, shape (1,3,224,224), float32
+    input_tensor = transformed.unsqueeze(0).cpu().numpy().astype(np.float32)
+    session = load_onnx_model()
+    outputs = session.run(None, {session.get_inputs()[0].name: input_tensor})
+    prob = 1 / (1 + np.exp(-outputs[0].item()))  # sigmoid
     return prob
 
 # Prepare test data
@@ -36,6 +69,9 @@ if __name__ == "__main__":
     y_pred = []
     fish_probs = []
     not_fish_probs = []
+    # Save transformed image for the first fish image
+    if fish_imgs:
+        predict(model, fish_imgs[0], save_transformed=True)
     for img_path in tqdm(fish_imgs, desc="Testing fish"):
         prob = predict(model, img_path)
         y_true.append(1)  # fish is now positive class (1)
@@ -51,9 +87,9 @@ if __name__ == "__main__":
     print("Sample not_fish probabilities:", not_fish_probs[:10])
 
     # Test on external images
-    for test_img, label in [("fish.png", "fish"), ("not_fish.png", "not_fish")]:
+    for test_img, label in [("fish_test.png", "fish"), ("not_fish.png", "not_fish")]:
         if os.path.exists(test_img):
-            prob = predict(model, test_img)
+            prob = predict(model, test_img, save_transformed=True)
             print(f"{test_img}: Probability of fish = {prob:.4f} => Predicted: {'fish' if prob > 0.5 else 'not_fish'}")
         else:
             print(f"{test_img} not found.")

@@ -61,7 +61,6 @@ coverage.xml
 .vscode/
 
 # Data
-fish_doodle_classifier.pth
 dataset/
 *.ndjson
 *.png

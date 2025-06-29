@@ -18,13 +18,24 @@ from sklearn.metrics import classification_report
 # === CONFIG ===
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 BATCH_SIZE = 32
-EPOCHS = 5
+EPOCHS = 100
 LEARNING_RATE = 1e-4
 VAL_SPLIT = 0.2
+
+# === UTILS: PIL loader with white background ===
+def pil_loader_white_bg(path):
+    img = Image.open(path)
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and 'transparency' in img.info):
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, img.convert("RGBA")).convert("RGB")
+    else:
+        img = img.convert("RGB")
+    return img
 
 # === TRANSFORMS ===
 basic_transform = transforms.Compose([
     transforms.Resize((224, 224)),
+    transforms.Lambda(lambda img: pil_loader_white_bg(img) if isinstance(img, str) else img),
     transforms.Grayscale(num_output_channels=3),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
@@ -32,6 +43,7 @@ basic_transform = transforms.Compose([
 
 augmented_transform = transforms.Compose([
     transforms.Resize((224, 224)),
+    transforms.Lambda(lambda img: pil_loader_white_bg(img) if isinstance(img, str) else img),
     transforms.Grayscale(num_output_channels=3),
     transforms.RandomRotation(15),
     transforms.RandomAffine(0, translate=(0.1, 0.1)),
@@ -48,11 +60,12 @@ def get_model():
     return model.to(DEVICE)
 
 # === TRAINING FUNCTION ===
-def train(model, train_loader, val_loader, class_weights, epochs=5):
-    # Swap class_weights for pos_weight: fish (minority, class 0) should be positive class
-    # So, invert the label mapping: treat fish as class 1, not_fish as class 0
+def train(model, train_loader, val_loader, class_weights, epochs=5, patience=5):
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([class_weights[0]/class_weights[1]]).to(DEVICE))
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
     model.train()
 
     for epoch in range(epochs):
@@ -60,7 +73,6 @@ def train(model, train_loader, val_loader, class_weights, epochs=5):
         correct = 0
         total = 0
         for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            # Invert labels: fish (original 0) -> 1, not_fish (original 1) -> 0
             labels = 1 - labels
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE).float().unsqueeze(1)
             optimizer.zero_grad()
@@ -76,17 +88,31 @@ def train(model, train_loader, val_loader, class_weights, epochs=5):
 
         acc = correct / total
         print(f"Epoch {epoch+1} Loss: {total_loss:.4f} | Train Acc: {acc:.4f}")
-        evaluate(model, val_loader)
+        val_loss = evaluate(model, val_loader, return_loss=True)
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict()
+        else:
+            patience_counter += 1
+            print(f"No improvement in val loss for {patience_counter} epoch(s).")
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}.")
+                if best_model_state is not None:
+                    model.load_state_dict(best_model_state)
+                break
 
 # === EVALUATION ===
-def evaluate(model, loader):
+def evaluate(model, loader, return_loss=False):
     model.eval()
     y_true = []
     y_pred = []
-
+    total_loss = 0
+    criterion = nn.BCEWithLogitsLoss()
     with torch.no_grad():
         for inputs, labels in loader:
-            # Invert labels for evaluation to match training
             labels = 1 - labels
             inputs = inputs.to(DEVICE)
             outputs = model(inputs)
@@ -94,8 +120,12 @@ def evaluate(model, loader):
             preds = (probs > 0.5).astype(int)
             y_true.extend(labels.numpy())
             y_pred.extend(preds)
-
+            if return_loss:
+                labels = labels.to(DEVICE).float().unsqueeze(1)
+                total_loss += criterion(outputs, labels).item()
     print(classification_report(y_true, y_pred, target_names=['fish', 'not_fish']))
+    if return_loss:
+        return total_loss
 
 # === DOWNLOAD .NDJSON FILE ===
 def download_ndjson(class_name, out_dir="quickdraw"):
@@ -138,7 +168,7 @@ def build_not_fish_from_classes(class_names, out_dir, max_per_class=1000):
     for cls in class_names:
         ndjson = download_ndjson(cls)
         draw_ndjson_to_png(ndjson, out_dir, max_count=max_per_class, prefix=f"{cls}_")
-    print(f"✅ Created not_fish set from {len(class_names)} classes.")
+    print(f"Created not_fish set from {len(class_names)} classes.")
 
 # === DATASET SPLIT LOADER ===
 def load_dataset(data_dir, use_augmented=True):
@@ -186,16 +216,28 @@ def main():
         ]
         build_not_fish_from_classes(not_fish_classes, os.path.join(args.data, "not_fish"), max_per_class=200)
 
-    print("📂 Loading dataset...")
+    print("Loading dataset...")
     train_loader, val_loader, class_weights = load_dataset(args.data)
 
-    print("🧠 Initializing model...")
+    print("Initializing model...")
     model = get_model()
 
-    print("🚀 Training...")
+    print("Training...")
     train(model, train_loader, val_loader, class_weights, epochs=EPOCHS)
 
-    print("💾 Saving model to fish_doodle_classifier.pth...")
+    print("Exporting model to fish_doodle_classifier.onnx...")
+    model.eval()  # Ensure eval mode before export
+    dummy_input = torch.randn(1, 3, 224, 224, device=DEVICE)
+    torch.onnx.export(
+        model,
+        dummy_input,
+        "fish_doodle_classifier.onnx",
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+        opset_version=11
+    )
+    print("Saving model to fish_doodle_classifier.pth...")
     torch.save(model.state_dict(), "fish_doodle_classifier.pth")
 
 
