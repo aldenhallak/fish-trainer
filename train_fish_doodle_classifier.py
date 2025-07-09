@@ -30,12 +30,14 @@ def plot_roc(y_true, y_probs):
     plt.show()
 
 # === CONFIG ===
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+print(f"Using device: {DEVICE}")
+
 BATCH_SIZE = 32
 EPOCHS = 100
-LEARNING_RATE = 1e-4  # Lower learning rate for more stable training
+LEARNING_RATE = 1e-4
 VAL_SPLIT = 0.2
-WEIGHT_DECAY = 5e-4  # Stronger L2 regularization
+WEIGHT_DECAY = 5e-4
 
 # === UTILS: PIL loader with white background ===
 def pil_loader_white_bg(path):
@@ -47,24 +49,31 @@ def pil_loader_white_bg(path):
         img = img.convert("RGB")
     return img
 
+# 🧠 M1 Optimization: Replace Lambda with a named callable class
+class WhiteBgLoader:
+    def __call__(self, img):
+        if isinstance(img, str):
+            return pil_loader_white_bg(img)
+        return img
+
 # === TRANSFORMS ===
 basic_transform = transforms.Compose([
     transforms.Resize((224, 224)),
-    transforms.Lambda(lambda img: pil_loader_white_bg(img) if isinstance(img, str) else img),
-    # Convert to grayscale for doodle classification - color is just noise
-    transforms.Grayscale(num_output_channels=3),  # Repeat grayscale to 3 channels for pretrained model
+    WhiteBgLoader(),  # replaces Lambda for multiprocessing safety
+    transforms.Grayscale(num_output_channels=3),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet stats still work
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
 # === MODEL ===
-
 def get_model():
     weights = EfficientNet_B0_Weights.DEFAULT
     model = efficientnet_b0(weights=weights)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, 1)
-    
-    return model.to(DEVICE)
+    model = model.to(DEVICE).to(memory_format=torch.channels_last)
+    # model = torch.compile(model)  # Uncomment if using PyTorch 2.x and want to try compilation
+    return model
+
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0):
         super().__init__()
@@ -78,14 +87,11 @@ class FocalLoss(nn.Module):
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
         return focal_loss.mean()
 
-# === TRAINING FUNCTION ===
 def train(model, train_loader, val_loader, class_weights, epochs=5, patience=5):
     pos_weight = torch.tensor([class_weights[1] / class_weights[0]]).to(DEVICE)
     print(f"Using pos_weight={pos_weight.item():.3f} for BCEWithLogitsLoss")
 
-    # You can swap this out with FocalLoss(alpha=0.25, gamma=2.0) if needed
     criterion = FocalLoss(alpha=0.8, gamma=2.0)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=8)
 
@@ -94,12 +100,15 @@ def train(model, train_loader, val_loader, class_weights, epochs=5, patience=5):
     best_model_state = None
 
     model.train()
+    disable_tqdm = DEVICE.type == "mps"
     for epoch in range(epochs):
         total_loss = 0
         correct = 0
         total = 0
-        for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE).float().unsqueeze(1)
+        for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", disable=disable_tqdm):
+            inputs = inputs.to(DEVICE, memory_format=torch.channels_last)
+            labels = labels.to(DEVICE).float().unsqueeze(1)
+
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, labels)
@@ -120,7 +129,7 @@ def train(model, train_loader, val_loader, class_weights, epochs=5, patience=5):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            best_model_state = model.state_dict().copy()
+            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
         else:
             patience_counter += 1
             print(f"No improvement in val loss for {patience_counter} epoch(s).")
@@ -130,19 +139,17 @@ def train(model, train_loader, val_loader, class_weights, epochs=5, patience=5):
                     model.load_state_dict(best_model_state)
                 break
 
-# === THRESHOLD OPTIMIZATION ===
 def find_optimal_threshold(model, loader):
-    """Find optimal threshold for classification based on F1 score"""
     model.eval()
     y_true = []
     y_probs = []
 
     with torch.no_grad():
         for inputs, labels in loader:
-            inputs = inputs.to(DEVICE)
+            inputs = inputs.to(DEVICE, memory_format=torch.channels_last)
             outputs = model(inputs)
             probs = torch.sigmoid(outputs).cpu().numpy().flatten()
-            y_true.extend(labels.numpy())
+            y_true.extend(labels.cpu().numpy().astype(np.float32))
             y_probs.extend(probs)
 
     from sklearn.metrics import f1_score, recall_score
@@ -163,10 +170,9 @@ def find_optimal_threshold(model, loader):
             best_threshold = threshold
 
     print(f"Optimal threshold: {best_threshold:.3f} (Combined Score: {best_score:.3f})")
-    plot_roc(y_true, y_probs)  # You'll need to pass these in from `find_optimal_threshold`
+    plot_roc(y_true, y_probs)
     return best_threshold
 
-# === EVALUATION ===
 def evaluate(model, loader, threshold=0.5, return_loss=False):
     model.eval()
     y_true = []
@@ -176,11 +182,11 @@ def evaluate(model, loader, threshold=0.5, return_loss=False):
 
     with torch.no_grad():
         for inputs, labels in loader:
-            inputs = inputs.to(DEVICE)
+            inputs = inputs.to(DEVICE, memory_format=torch.channels_last)
             outputs = model(inputs)
             probs = torch.sigmoid(outputs).cpu().numpy().flatten()
             preds = (probs > threshold).astype(int)
-            y_true.extend(labels.numpy())
+            y_true.extend(labels.cpu().numpy().astype(np.float32))
             y_pred.extend(preds)
             if return_loss:
                 labels = labels.to(DEVICE).float().unsqueeze(1)
@@ -194,14 +200,9 @@ def evaluate(model, loader, threshold=0.5, return_loss=False):
     if return_loss:
         return total_loss
 
-
-# === DATASET SPLIT LOADER ===
 def load_dataset(data_dir):
-    
-    # Check original class counts
     fish_count = len([f for f in os.listdir(os.path.join(data_dir, 'fish')) if f.endswith(('.png', '.jpg', '.jpeg'))])
     not_fish_count = len([f for f in os.listdir(os.path.join(data_dir, 'not_fish')) if f.endswith(('.png', '.jpg', '.jpeg'))])
-    
     print(f"Original counts - Fish: {fish_count}, Not-fish: {not_fish_count}")
         
     transform = basic_transform
@@ -217,21 +218,18 @@ def load_dataset(data_dir):
 
     train_subset = Subset(full_dataset, train_idx)
     val_subset = Subset(full_dataset, val_idx)
-
     label_counter = Counter([labels[i] for i in train_idx])
     print(f"Training class distribution: {dict(label_counter)}")
     
-    # Balanced weighting - let's try equal importance first
     weights = [1.0 / label_counter[labels[i]] for i in train_idx]
-    
     sampler = WeightedRandomSampler(weights, len(weights))
 
-    train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, sampler=sampler)
-    val_loader = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False)
+    use_pin_memory = DEVICE.type != "mps"  # 🧠 Disable pin_memory on MPS to avoid warning
+    train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=use_pin_memory)
+    val_loader = DataLoader(val_subset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=use_pin_memory)
 
     return train_loader, val_loader, label_counter
 
-# === MAIN ===
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', default='dataset', help='Path to dataset dir')
@@ -254,8 +252,8 @@ def main():
     evaluate(model, val_loader, threshold=optimal_threshold)
 
     print("Exporting model to fish_doodle_classifier.onnx...")
-    model.eval()  # Ensure eval mode before export
-    dummy_input = torch.randn(1, 3, 224, 224, device=DEVICE)
+    model.eval()
+    dummy_input = torch.randn(1, 3, 224, 224, device=DEVICE).to(memory_format=torch.channels_last)
     torch.onnx.export(
         model,
         dummy_input,
@@ -268,12 +266,9 @@ def main():
     print("Saving model to fish_doodle_classifier.pth...")
     torch.save(model.state_dict(), "fish_doodle_classifier.pth")
     
-    # Save optimal threshold for later use
     with open("optimal_threshold.txt", "w") as f:
         f.write(str(optimal_threshold))
     print(f"Optimal threshold {optimal_threshold:.3f} saved to optimal_threshold.txt")
-    
-
 
 if __name__ == "__main__":
     main()
