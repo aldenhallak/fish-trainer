@@ -14,13 +14,28 @@ from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from sklearn.metrics import roc_curve, auc
+import matplotlib.pyplot as plt
+
+def plot_roc(y_true, y_probs):
+    fpr, tpr, _ = roc_curve(y_true, y_probs)
+    auc_score = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f"AUC = {auc_score:.2f}")
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.title("ROC Curve")
+    plt.legend()
+    plt.show()
 
 # === CONFIG ===
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 BATCH_SIZE = 32
 EPOCHS = 100
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-4  # Lower learning rate for more stable training
 VAL_SPLIT = 0.2
+WEIGHT_DECAY = 5e-4  # Stronger L2 regularization
 
 # === UTILS: PIL loader with white background ===
 def pil_loader_white_bg(path):
@@ -36,44 +51,54 @@ def pil_loader_white_bg(path):
 basic_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.Lambda(lambda img: pil_loader_white_bg(img) if isinstance(img, str) else img),
-    transforms.Grayscale(num_output_channels=3),
+    # Convert to grayscale for doodle classification - color is just noise
+    transforms.Grayscale(num_output_channels=3),  # Repeat grayscale to 3 channels for pretrained model
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
-])
-
-augmented_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.Lambda(lambda img: pil_loader_white_bg(img) if isinstance(img, str) else img),
-    transforms.Grayscale(num_output_channels=3),
-    transforms.RandomRotation(15),
-    transforms.RandomAffine(0, translate=(0.1, 0.1)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet stats still work
 ])
 
 # === MODEL ===
+
 def get_model():
-    model = models.resnet18(pretrained=True)
-    model.fc = nn.Sequential(
-        nn.Linear(model.fc.in_features, 1)
-    )
+    weights = EfficientNet_B0_Weights.DEFAULT
+    model = efficientnet_b0(weights=weights)
+    model.classifier[1] = nn.Linear(model.classifier[1].in_features, 1)
+    
     return model.to(DEVICE)
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, input, target):
+        bce_loss = self.bce(input, target)
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        return focal_loss.mean()
 
 # === TRAINING FUNCTION ===
 def train(model, train_loader, val_loader, class_weights, epochs=5, patience=5):
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([class_weights[0]/class_weights[1]]).to(DEVICE))
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    pos_weight = torch.tensor([class_weights[1] / class_weights[0]]).to(DEVICE)
+    print(f"Using pos_weight={pos_weight.item():.3f} for BCEWithLogitsLoss")
+
+    # You can swap this out with FocalLoss(alpha=0.25, gamma=2.0) if needed
+    criterion = FocalLoss(alpha=0.8, gamma=2.0)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=8)
+
     best_val_loss = float('inf')
     patience_counter = 0
     best_model_state = None
-    model.train()
 
+    model.train()
     for epoch in range(epochs):
         total_loss = 0
         correct = 0
         total = 0
         for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
-            labels = 1 - labels
             inputs, labels = inputs.to(DEVICE), labels.to(DEVICE).float().unsqueeze(1)
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -90,11 +115,12 @@ def train(model, train_loader, val_loader, class_weights, epochs=5, patience=5):
         print(f"Epoch {epoch+1} Loss: {total_loss:.4f} | Train Acc: {acc:.4f}")
         val_loss = evaluate(model, val_loader, return_loss=True)
 
-        # Early stopping
+        scheduler.step(val_loss)
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            best_model_state = model.state_dict()
+            best_model_state = model.state_dict().copy()
         else:
             patience_counter += 1
             print(f"No improvement in val loss for {patience_counter} epoch(s).")
@@ -104,75 +130,81 @@ def train(model, train_loader, val_loader, class_weights, epochs=5, patience=5):
                     model.load_state_dict(best_model_state)
                 break
 
+# === THRESHOLD OPTIMIZATION ===
+def find_optimal_threshold(model, loader):
+    """Find optimal threshold for classification based on F1 score"""
+    model.eval()
+    y_true = []
+    y_probs = []
+
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs = inputs.to(DEVICE)
+            outputs = model(inputs)
+            probs = torch.sigmoid(outputs).cpu().numpy().flatten()
+            y_true.extend(labels.numpy())
+            y_probs.extend(probs)
+
+    from sklearn.metrics import f1_score, recall_score
+    thresholds = np.arange(0.1, 0.9, 0.05)
+    best_threshold = 0.5
+    best_score = 0
+
+    for threshold in thresholds:
+        y_pred = (np.array(y_probs) > threshold).astype(int)
+        f1 = f1_score(y_true, y_pred, average='macro')
+        recall_fish = recall_score(y_true, y_pred, pos_label=0)
+        recall_not_fish = recall_score(y_true, y_pred, pos_label=1)
+        balanced_recall = (recall_fish + recall_not_fish) / 2
+        combined_score = 0.7 * f1 + 0.3 * balanced_recall
+
+        if combined_score > best_score:
+            best_score = combined_score
+            best_threshold = threshold
+
+    print(f"Optimal threshold: {best_threshold:.3f} (Combined Score: {best_score:.3f})")
+    plot_roc(y_true, y_probs)  # You'll need to pass these in from `find_optimal_threshold`
+    return best_threshold
+
 # === EVALUATION ===
-def evaluate(model, loader, return_loss=False):
+def evaluate(model, loader, threshold=0.5, return_loss=False):
     model.eval()
     y_true = []
     y_pred = []
     total_loss = 0
     criterion = nn.BCEWithLogitsLoss()
+
     with torch.no_grad():
         for inputs, labels in loader:
-            labels = 1 - labels
             inputs = inputs.to(DEVICE)
             outputs = model(inputs)
             probs = torch.sigmoid(outputs).cpu().numpy().flatten()
-            preds = (probs > 0.5).astype(int)
+            preds = (probs > threshold).astype(int)
             y_true.extend(labels.numpy())
             y_pred.extend(preds)
             if return_loss:
                 labels = labels.to(DEVICE).float().unsqueeze(1)
                 total_loss += criterion(outputs, labels).item()
+
+    from sklearn.metrics import confusion_matrix
     print(classification_report(y_true, y_pred, target_names=['fish', 'not_fish']))
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_true, y_pred))
+
     if return_loss:
         return total_loss
 
-# === DOWNLOAD .NDJSON FILE ===
-def download_ndjson(class_name, out_dir="quickdraw"):
-    os.makedirs(out_dir, exist_ok=True)
-    url = f"https://storage.googleapis.com/quickdraw_dataset/full/simplified/{class_name}.ndjson"
-    dest = os.path.join(out_dir, f"{class_name}.ndjson")
-    if not os.path.exists(dest):
-        print(f"Downloading {class_name}.ndjson...")
-        urllib.request.urlretrieve(url, dest)
-    return dest
-
-# === DRAW .NDJSON DOODLES ===
-def draw_ndjson_to_png(ndjson_path, out_dir, max_count=1000, prefix=""):
-    os.makedirs(out_dir, exist_ok=True)
-    with open(ndjson_path, 'r') as f:
-        saved = 0
-        for i, line in enumerate(f):
-            drawing = json.loads(line)['drawing']
-            total_points = sum(len(stroke[0]) for stroke in drawing)
-            if total_points < 150:
-                continue
-            img = np.ones((256, 256), dtype=np.uint8) * 255
-            for stroke in drawing:
-                for j in range(len(stroke[0]) - 1):
-                    pt1 = (int(stroke[0][j]), int(stroke[1][j]))
-                    pt2 = (int(stroke[0][j+1]), int(stroke[1][j+1]))
-                    cv2.line(img, pt1, pt2, 0, 2)
-            # Only save if enough ink (non-white pixels)
-            ink_pixels = np.sum(img < 250)  # count pixels that are not white
-            if ink_pixels < 500:  # require at least 100 ink pixels
-                continue
-            filename = os.path.join(out_dir, f"{prefix}{saved}.png")
-            cv2.imwrite(filename, img)
-            saved += 1
-            if saved >= max_count:
-                break
-
-# === MULTI-CLASS NOT-FISH BUILDER ===
-def build_not_fish_from_classes(class_names, out_dir, max_per_class=1000):
-    for cls in class_names:
-        ndjson = download_ndjson(cls)
-        draw_ndjson_to_png(ndjson, out_dir, max_count=max_per_class, prefix=f"{cls}_")
-    print(f"Created not_fish set from {len(class_names)} classes.")
 
 # === DATASET SPLIT LOADER ===
-def load_dataset(data_dir, use_augmented=True):
-    transform = augmented_transform if use_augmented else basic_transform
+def load_dataset(data_dir):
+    
+    # Check original class counts
+    fish_count = len([f for f in os.listdir(os.path.join(data_dir, 'fish')) if f.endswith(('.png', '.jpg', '.jpeg'))])
+    not_fish_count = len([f for f in os.listdir(os.path.join(data_dir, 'not_fish')) if f.endswith(('.png', '.jpg', '.jpeg'))])
+    
+    print(f"Original counts - Fish: {fish_count}, Not-fish: {not_fish_count}")
+        
+    transform = basic_transform
     full_dataset = datasets.ImageFolder(data_dir, transform=transform)
     labels = [label for _, label in full_dataset]
 
@@ -187,7 +219,11 @@ def load_dataset(data_dir, use_augmented=True):
     val_subset = Subset(full_dataset, val_idx)
 
     label_counter = Counter([labels[i] for i in train_idx])
-    weights = [1. / label_counter[labels[i]] for i in train_idx]
+    print(f"Training class distribution: {dict(label_counter)}")
+    
+    # Balanced weighting - let's try equal importance first
+    weights = [1.0 / label_counter[labels[i]] for i in train_idx]
+    
     sampler = WeightedRandomSampler(weights, len(weights))
 
     train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, sampler=sampler)
@@ -201,21 +237,7 @@ def main():
     parser.add_argument('--data', default='dataset', help='Path to dataset dir')
     parser.add_argument('--pretrain', action='store_true', help='Pretrain with QuickDraw')
     args = parser.parse_args()
-
-    if args.pretrain:
-        print("🔧 Generating QuickDraw dataset...")
-
-        # Fish
-        fish_ndjson = download_ndjson("fish")
-        draw_ndjson_to_png(fish_ndjson, os.path.join(args.data, "fish"), max_count=1950, prefix="fish_ndjson_")
-
-        # Not fish: using multiple unrelated classes
-        not_fish_classes = [
-            "cat", "banana", "submarine", "face", "octopus",
-            "crab", "broccoli", "cloud", "truck", "basket"
-        ]
-        build_not_fish_from_classes(not_fish_classes, os.path.join(args.data, "not_fish"), max_per_class=200)
-
+    
     print("Loading dataset...")
     train_loader, val_loader, class_weights = load_dataset(args.data)
 
@@ -224,6 +246,12 @@ def main():
 
     print("Training...")
     train(model, train_loader, val_loader, class_weights, epochs=EPOCHS)
+
+    print("Finding optimal threshold...")
+    optimal_threshold = find_optimal_threshold(model, val_loader)
+    
+    print(f"Final evaluation with threshold {optimal_threshold:.3f}:")
+    evaluate(model, val_loader, threshold=optimal_threshold)
 
     print("Exporting model to fish_doodle_classifier.onnx...")
     model.eval()  # Ensure eval mode before export
@@ -239,6 +267,12 @@ def main():
     )
     print("Saving model to fish_doodle_classifier.pth...")
     torch.save(model.state_dict(), "fish_doodle_classifier.pth")
+    
+    # Save optimal threshold for later use
+    with open("optimal_threshold.txt", "w") as f:
+        f.write(str(optimal_threshold))
+    print(f"Optimal threshold {optimal_threshold:.3f} saved to optimal_threshold.txt")
+    
 
 
 if __name__ == "__main__":

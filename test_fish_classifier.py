@@ -54,7 +54,7 @@ def predict(model, image_path, save_transformed=False):
     session = load_onnx_model()
     outputs = session.run(None, {session.get_inputs()[0].name: input_tensor})
     prob = 1 / (1 + np.exp(-outputs[0].item()))  # sigmoid
-    return prob
+    return 1.0- prob
 
 # Prepare test data
 fish_dir = os.path.join(DATASET_DIR, "fish")
@@ -64,6 +64,14 @@ fish_imgs = [os.path.join(fish_dir, f) for f in os.listdir(fish_dir) if f.lower(
 not_fish_imgs = [os.path.join(not_fish_dir, f) for f in os.listdir(not_fish_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
 
 if __name__ == "__main__":
+    # Load optimal threshold
+    optimal_threshold = 0.35  # Default
+    if os.path.exists("optimal_threshold.txt"):
+        with open("optimal_threshold.txt", "r") as f:
+            optimal_threshold = float(f.read().strip())
+    
+    print(f"Using optimal threshold: {optimal_threshold}")
+    
     model = load_model()
     y_true = []
     y_pred = []
@@ -75,14 +83,14 @@ if __name__ == "__main__":
     for img_path in tqdm(fish_imgs, desc="Testing fish"):
         prob = predict(model, img_path)
         y_true.append(1)  # fish is now positive class (1)
-        y_pred.append(int(prob > 0.5))  # predict fish if prob > 0.5
+        y_pred.append(int(prob > optimal_threshold))
         fish_probs.append(prob)
     for img_path in tqdm(not_fish_imgs, desc="Testing not_fish"):
         prob = predict(model, img_path)
         y_true.append(0)  # not_fish is negative class (0)
-        y_pred.append(int(prob > 0.5))  # predict fish if prob > 0.5
+        y_pred.append(int(prob > optimal_threshold))
         not_fish_probs.append(prob)
-    print(classification_report(y_true, y_pred, target_names=["not_fish", "fish"]))
+    print(classification_report(y_true, y_pred, target_names=["fish", "not_fish"]))
     print("\nSample fish probabilities:", fish_probs[:10])
     print("Sample not_fish probabilities:", not_fish_probs[:10])
 
@@ -90,6 +98,6 @@ if __name__ == "__main__":
     for test_img, label in [("fish_test.png", "fish"), ("not_fish.png", "not_fish")]:
         if os.path.exists(test_img):
             prob = predict(model, test_img, save_transformed=True)
-            print(f"{test_img}: Probability of fish = {prob:.4f} => Predicted: {'fish' if prob > 0.5 else 'not_fish'}")
+            print(f"{test_img}: Probability of fish = {prob:.4f} => Predicted: {'fish' if prob > optimal_threshold else 'not_fish'}")
         else:
             print(f"{test_img} not found.")
